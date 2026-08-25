@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/spf13/viper"
@@ -24,14 +26,25 @@ type AgentConfig struct {
 
 var (
 	cfg  *Config
-	v    *viper.Viper
+	v    *viper.Viper = viper.New()
 	mu   sync.RWMutex
 	once sync.Once
 )
 
 func Init() error {
-	// TODO: Initialize the config singleton
+	// TODO: Initialize vars
+
 	// Load from the config file, and fall back to built-in defaults
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(homeDir, ".config", "cronmate", "config.yaml")
+	v.AddConfigPath(configPath)
+	err = v.ReadInConfig()
+	if err != nil {
+		return err
+	}
 
 	// 0. global variable initialization with built-in defaults
 
