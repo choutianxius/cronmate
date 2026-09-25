@@ -2,14 +2,16 @@
 
 > Local LLM cron job daemon CLI in Go. `cronmate` manages prompt files on disk, schedules them via cron expressions, runs them through an LLM with safe tools (e.g. HN digest), and persists results in SQLite. Data at rest private and secure (0600 + OS keychain).
 
+> **Scope note (2026-08-25):** Later phases remain directional and may be over-scoped. The config contract in Q2 and Section 4 is current and takes precedence over older examples elsewhere in this document.
+
 ## 0. Decisions Log
 
 * **Q1 LLM Provider:** Decided later. Code must abstract via `LLMClient` interface. Start impl with OpenAI-compatible (covers Ollama, OpenAI, vLLM) as it's easiest to test locally.
-* **Q2 Config UX:** `$EDITOR` like `git config`. `cronmate config` opens `config.yaml` in `$EDITOR`. `cronmate config list/get/set/path` also supported. Same for `edit <job>` — opens prompt file in `$EDITOR`. Respect `VISUAL` > `EDITOR` > `vi`.
+* **Q2 Config UX (LOCKED):** Cronmate reads one user-managed YAML file at `~/.config/cronmate/config.yaml`. The config service never rewrites it; `config --edit` creates an empty file if absent, then delegates changes to the editor. The CLI exposes `config --show`, `--edit` / `-e`, `--reload`, and `--validate` / `--test` / `-t`. There are no `config set/list/get/path` commands.
 * **Q3 Encryption:** No SQLCipher in v1. Use `0600` file perms + keyring for secrets + startup permission audit. Optionally app-level AES-GCM for `runs.output` later, key in keyring.
 * **Q4 Metadata Duplication (LOCKED Option A):** DB = source of truth for job metadata (schedule, model, tools, enabled). Prompt file = source of truth for prompt body (pure markdown, no frontmatter at runtime). No drift because each piece has one owner, linked by `jobs.prompt_path`. Export/import generates/parses frontmatter only for sharing (Option A/C hybrid). See Section 9.
-* **Q5 Prompts Classification (Decided):** Prompts are **data**, not config. Treated as job payload / mutable user data under `XDG_DATA_HOME`, not `XDG_CONFIG_HOME`. Default `prompts_dir = {data_dir}/prompts`, 0600 perms, lifecycle tied to job. `create` copies into data dir by default, `--link` opts into external path.
-* **Q6 External MCP Support (Added):** Jobs may call external MCP servers (Model Context Protocol). Tool system must be extensible: built-in tools + MCP tools (stdio/SSE/streamable HTTP). Config adds `mcp_servers` map. Executor holds MCP client manager. See Section 7b.
+* **Q5 Prompts Classification (Decided):** Prompts are **data**, not config. Treated as job payload / mutable user data under `XDG_DATA_HOME`, not the fixed config file. The recommended `prompts_dir` is `{data_dir}/prompts`, with 0600 files and lifecycle tied to the job. `create` copies into data dir by default, while `--link` opts into an external path.
+* **Q6 External MCP Support (Directional):** Jobs may eventually call external MCP servers (Model Context Protocol). If retained, this extends the read-only config schema and executor; it is not part of the current config milestone. See Section 7b.
 
 ## 1. Product Summary
 
@@ -31,15 +33,15 @@ cronmate          # start if not running, else status (like orbstack/colima)
 cronmate status [--watch]
 cronmate kill
 cronmate restart
-cronmate config [list|get <k>|set <k> <v>|edit|path]
+cronmate config [--show | --edit | -e | --reload | --validate | --test]
 cronmate logs [-f --job <name>]
 ```
 
-### Data Locations (XDG) — Updated: Prompts Are Data
+### Runtime Locations — Updated: Prompts Are Data
 
 ```
-Config:   $XDG_CONFIG_HOME/cronmate/  (~/.config/cronmate/)  [0600]
-          └── config.yaml   — only declarative settings: providers, scheduler defaults, paths
+Config:   ~/.config/cronmate/config.yaml
+          └── fixed, user-managed YAML file; cronmate only reads it
 
 Data:     $XDG_DATA_HOME/cronmate/  (~/.local/share/cronmate/)  [0700 dir, 0600 files]
           ├── cronmate.db    (WAL, jobs/runs/artifacts)
@@ -55,9 +57,10 @@ Cache:    $XDG_CACHE_HOME/cronmate/ (LLM responses if cached)
 ```
 
 Rationale for data:
-* Config is small, portable, expected to be hand-edited, checked in dotfiles.
+* Config is small, portable, expected to be hand-edited, checked in dotfiles, and preferably mode `0600`.
+* `XDG_CONFIG_HOME` does not override the config location. Only `config --edit` may create the directory and an empty file when absent; cronmate never rewrites an existing file.
 * Prompts are large, frequently changed via `edit`, tied to job lifecycle (created with `create`, removed with `remove`), versioned via `runs.input_prompt_hash`, backed up with DB.
-* User may still symlink `prompts_dir` to a git repo if they want GitOps, but default is data dir. This also avoids confusion where `config` contains secrets-adjacent content.
+* User may still symlink `prompts_dir` to a git repo if they want GitOps, but the recommended location is under the data dir. This also avoids confusion where `config` contains secrets-adjacent content.
 * `cronmate create --prompt ./my.md` should **copy** file into `data_dir/prompts/<ulid>.md` and store that copied path in DB. Flag `--link` can keep external path for power users.
 
 ## 2. Architecture
@@ -66,7 +69,7 @@ Rationale for data:
 CLI (cobra) ──HTTP over UDS──> Daemon
   |                              |
   ├─ parses flags                ├─ Daemon Lifecycle (pidfile flock + signal handling)
-  ├─ client dials sock           ├─ Config Loader (YAML + env)
+  ├─ client dials sock           ├─ Config Loader (fixed YAML file)
   └─ runs local if daemon req    ├─ SQLite Store (WAL, migrations)
                                   ├─ Scheduler (robfig/cron v3)
                                   ├─ Executor (worker pool, context timeout)
@@ -136,61 +139,38 @@ CREATE INDEX idx_artifacts_job_key ON artifacts(job_id, key);
 
 ## 4. Config System
 
-Library: `goccy/go-yaml` or `spf13/viper` light usage. Prefer viper only if needed, otherwise simple YAML marshal/unmarshal to keep deps small.
+Library: `spf13/viper`, using the package's single global Viper instance.
 
-Prompts are data => `prompts_dir` default is inside `data_dir`, not config dir. Config stores only the path pointer, not the content.
+The config service is read-only. It always resolves the same path from the user's home directory: `~/.config/cronmate/config.yaml`. It does not honor `XDG_CONFIG_HOME`, search alternate paths, support alternate formats, apply environment overrides, create missing files, or write changes.
 
 ```yaml
-# ~/.config/cronmate/config.yaml (0600)
+# ~/.config/cronmate/config.yaml
 data_dir: ~/.local/share/cronmate
-prompts_dir: ~/.local/share/cronmate/prompts  # default = {data_dir}/prompts
+prompts_dir: ~/.local/share/cronmate/prompts
 log_level: info
-timezone: Local
-
-models:
-  default_provider: openai
-  default_model: gpt-4o-mini
-  providers:
-    openai:
-      base_url: https://api.openai.com/v1
-    ollama:
-      base_url: http://localhost:11434
-    anthropic:
-      base_url: https://api.anthropic.com
-
-scheduler:
-  max_concurrent_jobs: 2
-  overlapping_policy: skip # skip | queue | run_parallel
-
-security:
-  tool_allowlist_default: [fetch_hn, fetch_url, sqlite_write, file_write]
-  file_write_root: ~/.local/share/cronmate/outputs
-
-# MCP servers — global defaults, can be overridden per job via tools allowlist
-mcp_servers:
-  filesystem:
-    # stdio transport
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-    env: {}
-    # timeout for tool calls
-    timeout: 30s
-  fetch:
-    transport: stdio
-    command: uvx
-    args: ["mcp-server-fetch"]
-  linear:
-    # streamable HTTP / SSE
-    transport: http
-    url: https://mcp.linear.app/sse
-    headers:
-      Authorization: Bearer ${LINEAR_API_KEY}  # resolved from env/keyring
+time_zone: Local
+agent:
+  provider: openai
+  model: gpt-4o-mini
+  base_url: https://api.openai.com/v1
 ```
 
-* `cronmate config edit` -> `sh -c "$EDITOR <config.yaml>"`. Git-style.
-* `cronmate config set scheduler.max_concurrent_jobs 4` — dot-path set.
-* env override: `CRONMATE_DATA_DIR`.
+Current service behavior:
+
+* `Path` returns the fixed path.
+* `Load` / `Init` read and decode the file into `Config`; omitted fields remain zero values.
+* `Reload` refreshes the same global Viper instance. Loads are serialized, and a failed reload keeps the last valid typed and Viper state.
+* `Current` returns the last valid typed snapshot; `Get` remains an internal dotted-key reader.
+* `ReadRaw` reads the file unchanged for the `--show` command.
+* Missing, unreadable, or malformed files return errors. No config operation writes to disk.
+
+CLI behavior:
+
+* `cronmate config --show` prints the raw file to stdout.
+* `cronmate config --edit` / `-e` creates the directory (`0700`) and an empty file (`0600`) if absent, then opens the fixed path using `VISUAL` > `EDITOR` > `vi`; subsequent writes are performed by the editor.
+* `cronmate config --reload` silently refreshes config in the current CLI process; it does not signal a daemon.
+* `cronmate config --validate` / `--test` silently checks file existence, YAML syntax, and decoding into the current config types.
+* `--show` and `--edit` must remain usable when YAML is malformed so the user can inspect or repair it.
 
 ## 5. Daemon Lifecycle (internal/daemon)
 
@@ -214,7 +194,7 @@ Go concepts: `os/signal`, `context.WithCancel`, `net.Listen("unix", ...)`, `sync
 * On tick: create `runs` row `pending`, check policy, if `skip` and previous `running` -> mark `skipped`.
 * Hand off to `executor.Execute(ctx, job, run)`.
 
-Timezone: use config `timezone`. Schedule parsing: accept both standard crontab and `@daily`, `@every 1h`.
+Timezone: use config `time_zone`. Schedule parsing: accept both standard crontab and `@daily`, `@every 1h`.
 
 ## 7. Executor + LLM + Tools (including MCP)
 
@@ -327,13 +307,16 @@ All tool executions logged in `runs.tool_calls_json`. No shell.
 * `create`: flags `--name, --schedule, --prompt-file, --model, --tools`. If missing, interactive prompt with `AlecAivazis/survey` or `charmbracelet/huh`. Copy prompt file into `prompts_dir` if outside? Keep original path but warn. Insert into DB.
 * `edit <job>`: 2 modes to be decided (see Section 9). For now: open prompt file in `$EDITOR`. After editor closes, re-hash, maybe update DB `updated_at`. Do not parse frontmatter yet pending Q4.
 * `list/show`: table writer (`olekukonko/tablewriter`).
-* `config edit`: `$EDITOR` config.yaml.
+* `config --show`: print `~/.config/cronmate/config.yaml` unchanged to stdout.
+* `config --edit` / `-e`: create an empty config file if absent, then open it using `VISUAL` > `EDITOR` > `vi`; do not require the YAML to parse first.
+* `config --reload`: silently reload config in the current process.
+* `config --validate` / `--test`: silently parse and decode config, returning a non-zero status on failure.
 
 ## 9. Metadata Drift — LOCKED: Option A (DB Truth, Prompt = Pure Body)
 
 **Resolution per Q5 (prompts=Data):** This simplifies to no drift by design.
 
-* **Config** (`~/.config/cronmate/config.yaml`): app-wide settings only: default models, paths, scheduler policy.
+* **Config** (`~/.config/cronmate/config.yaml`): fixed, user-managed, read-only input for app-wide settings.
 * **Data** (`~/.local/share/cronmate/`):
   * `cronmate.db` = **source of truth for job metadata**: `name, schedule, model_provider, model_name, enabled, tools_json, timeout`. Fast query for scheduler, no FS scan.
   * `prompts/<name>--<ulid>.md` = **source of truth for prompt body**: raw markdown, no frontmatter at runtime. Versioned via `runs.input_prompt_hash`.
@@ -384,7 +367,7 @@ cronmate/
     main.go
   internal/
     cli/           # cobra commands, table printing, editor launch, export/import
-    config/        # XDG paths, load/save, validation, keyring helpers (ONLY config.yaml, no prompts)
+    config/        # fixed config path, Viper load/reload, typed and raw reads
     store/         # DB open, migrations, job/run/artifact CRUD, queries
     daemon/        # lifecycle, pidfile, socket server, client
     scheduler/     # cron wrapper + policy
@@ -412,7 +395,7 @@ Go libs:
 * `robfig/cron/v3`
 * `modernc.org/sqlite` (pure Go, no CGO) — alternative `mattn/go-sqlite3` if you want CGO performance.
 * `zalando/go-keyring`
-* `goccy/go-yaml` + `BurntSushi/toml` (support both yaml/toml config per discussion)
+* `spf13/viper` (YAML config reads)
 * `google/ulid` or `oklog/ulid`
 * `rs/zerolog` for logging (or std `log/slog`)
 * `olekukonko/tablewriter`
@@ -420,16 +403,14 @@ Go libs:
 
 ## 11. Phased Plan + Go Learning Map
 
-### Phase 0: Scaffolding (Day 1)
-* `go mod init github.com/<you>/cronmate`, `cmd/cronmate/main.go` prints "cronmate".
-* Install cobra scaffold, `Makefile` with `build`, `fmt`, `vet`.
+### Phase 0: Scaffolding (DONE)
+* Go module, `cmd/cronmate/main.go`, Cobra root command, and `Makefile` are present.
 * **Learn:** modules, packages, `main` vs `internal`, `go run`, `go build`, imports.
 
 ### Phase 1: Config + Store
-* Implement `config.Paths()` returning XDG paths, create dirs with 0700/0600 checks.
-* `config.yaml` load/save with defaults.
+* [DONE] Implement the read-only config service for `~/.config/cronmate/config.yaml` with Viper, reload support, and tests.
+* [DONE] Replace the provisional config CLI with `--show`, `--edit` / `-e`, `--reload`, and `--validate` / `--test`; none writes config through the service.
 * `store` open SQLite WAL, embed migrations, CRUD for jobs.
-* `cli`: `config list/path` direct file.
 * **Learn:** structs, pointers, `os` package, `filepath`, `embed`, `database/sql`, error wrapping `%w`.
 
 ### Phase 2: Job CRUD CLI
@@ -466,22 +447,22 @@ Go libs:
 
 ### Phase 6b: MCP Integration (New, after Phase 6)
 * Implement `internal/mcp` — manager, stdio client lifecycle, SSE client.
-* Config: `mcp_servers` map + env expansion + keyring for headers.
+* If retained, extend the read-only config schema with `mcp_servers`; do not add config mutation commands.
 * Tool discovery: `tools/list`, cache, convert to OpenAI tool format with `mcp__<server>__<tool>` prefix.
 * Routing: executor routes MCP calls to manager, logging + timeout.
-* CLI: `cronmate config list --tools`, `cronmate mcp list/test <server>`.
+* CLI: `cronmate mcp list/test <server>`.
 * Safety: command allowlist, SSRF guard for http MCP, max output 1MB, audit log.
 * Test with `mcp-server-fetch` + `filesystem` MCP servers.
 * **Learn:** `os/exec` process management, JSON-RPC, context with timeout, concurrency (manager holds map of clients with mutex), `io` piping.
 
 ### Phase 7: Hardening + Logs
-* Permissions audit at startup, keyring API key commands `cronmate config set-key openai`.
+* Permissions audit at startup and keyring API key management outside the read-only config command.
 * `logs -f` via SSE or chunked HTTP over UDS, includes MCP server logs.
 * `golangci-lint`, `go vet`, integration test e2e including MCP mock server.
 * **Learn:** security, file modes, keyring, streaming.
 
 ### Phase 8: Polish & OS Integration
-* launchd plist generator `cronmate config --init-launchd`.
+* launchd plist generator as a separate command, not a config mutation flag.
 * `export/import` for portability (now decided: implements Option A/C hybrid). Export includes `mcp_servers` needed? No, export is job-level, not server-level. But mention required MCP servers in exported comment.
 * README, demo gif with MCP example (e.g. fetch + filesystem + linear).
 * **Learn:** build tags, conditional compilation, release via `goreleaser`.
@@ -501,15 +482,15 @@ Go libs:
 * [ ] MCP http servers SSRF guard (deny private IPs unless allow_private).
 * [ ] MCP destructive tools (write_file, delete) flagged, optionally require confirm (v2).
 
-## 13. Next Steps (Locked + MCP Added)
+## 13. Next Steps
 
 1. [DONE] Q4 locked to Option A (DB truth, prompt = pure body) + Q5 prompts=data.
-2. [DONE] Q6 MCP support added as first-class pluggable tools.
+2. [DIRECTIONAL] Q6 MCP support remains a possible later extension, outside the current config milestone.
 3. v1 skips frontmatter parser at runtime; only used in `export/import` (interchange format), to be implemented in Phase 8.
-4. Ready to scaffold Phase 0+1: `go mod init`, config paths, SQLite store with migrations, basic CLI job CRUD.
+4. Config service and scoped config CLI are implemented; next is the store and basic job CRUD.
 5. Naming decision for prompt files locked: `${name}--${ulid}.md`.
-6. Next design after scaffold: confirm `mcp-go` library choice and whether to eager-start MCP servers or lazy per-job.
+6. If MCP remains in scope later, confirm the library choice and whether to eager-start servers or start them lazily per job.
 
 ---
 
-*Last updated: 2026-07-23. Q1 (LLM provider) still open, no scaffold yet per request. Ready to scaffold when you say go.*
+*Last updated: 2026-08-25. The config service is implemented; broader later phases remain directional.*
