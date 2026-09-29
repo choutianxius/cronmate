@@ -29,12 +29,12 @@ cronmate remove <name|id> [--force]
 cronmate run <name|id> --now  # manual trigger / dry run
 
 # daemon commands
-cronmate          # start if not running, else status (like orbstack/colima)
-cronmate status [--watch]
-cronmate kill
-cronmate restart
+cronmate daemon start [--foreground]
+cronmate daemon status [--watch]
+cronmate daemon stop                  # `kill` is a graceful-stop alias
+cronmate daemon restart [--foreground]
 cronmate config [--show | --edit | -e | --reload | --validate | --test]
-cronmate logs [-f --job <name>]
+cronmate daemon logs [-f --job <name>] # planned with Phase 7 logging
 ```
 
 ### Runtime Locations — Updated: Prompts Are Data
@@ -163,6 +163,7 @@ Current service behavior:
 * `Current` returns the last valid typed snapshot; `Get` remains an internal dotted-key reader.
 * `ReadRaw` reads the file unchanged for the `--show` command.
 * Missing, unreadable, or malformed files return errors. No config operation writes to disk.
+* Daemon commands resolve an omitted/empty `data_dir` to `$XDG_DATA_HOME/cronmate` when that variable is absolute, otherwise `~/.local/share/cronmate`. The config service itself still preserves the omitted field as a zero value.
 
 CLI behavior:
 
@@ -175,16 +176,18 @@ CLI behavior:
 ## 5. Daemon Lifecycle (internal/daemon)
 
 1. Resolve paths via `internal/config`.
-2. Acquire `cronmate.pid` flock (`syscall.Flock` + O_EXCL create). If fail, try to dial existing socket: if alive, "already running", if dead, stale cleanup.
+2. Open/create `cronmate.pid`, acquire a non-blocking `flock`, and keep its file descriptor open for the daemon lifetime. The lock is authoritative; stale contents are overwritten only after ownership is acquired.
 3. Open DB, run migrations (`internal/store/migrations/*.sql` embedded via `go:embed`).
-4. Create UDS listener at `cronmate.sock` with `0600`, unlink stale first. `http.Serve` with mux: `/api/status`, `/api/jobs/*`, `/api/logs`.
+4. Create UDS listener at `cronmate.sock` with `0600`, unlink stale first. `http.Serve` with mux: `/api/status`, generation-bound `/api/shutdown`, `/api/jobs/*`, `/api/logs`.
 5. Load jobs from DB, create `scheduler.Runner` (wraps `cron.Cron`).
-6. Signal handling: `SIGINT/SIGTERM` -> graceful: stop cron, wait for running jobs up to timeout, close DB, unlink sock+pid. `SIGHUP` -> reload config + resync scheduler.
+6. Signal handling: `SIGINT/SIGTERM` -> graceful shutdown. `SIGHUP` config reload and scheduler resync are added with the scheduler integration.
 7. Log to `logs/daemon.log` + stderr if foreground.
 
-Bare `cronmate` command (no subcommand):
-* Check socket: if dial ok -> show status (call `status` cmd).
-* Else daemonize: `exec.Command(os.Args[0], "--daemon")` with `Setsid`, redirect logs, exit parent. Child runs daemon loop.
+Daemon lifecycle is explicit and contained under `cronmate daemon`:
+* Bare `cronmate` and bare `cronmate daemon` show help and have no process side effects.
+* `cronmate daemon start` re-executes `cronmate daemon start --foreground` with `Setsid`, redirects output to `logs/daemon.log`, and waits for the socket to report the spawned PID.
+* `cronmate daemon stop` validates the socket and pidfile refer to the same daemon, sends a shutdown request containing the current daemon instance ID over the UDS, and waits for daemon-owned runtime files to disappear. `kill` is a compatibility alias for the same graceful operation.
+* `cronmate daemon restart` completes a graceful stop before starting the replacement. `--foreground` keeps the new process attached to the terminal.
 
 Go concepts: `os/signal`, `context.WithCancel`, `net.Listen("unix", ...)`, `sync.WaitGroup`, `embed.FS`.
 
@@ -302,8 +305,9 @@ All tool executions logged in `runs.tool_calls_json`. No shell.
 
 ## 8. CLI (internal/cli, cobra)
 
-* Root cmd: if no args and not `--daemon` internal flag, check daemon status logic.
-* Each job cmd uses client: `internal/daemon/client.go` that dials UDS. If daemon not running for read cmds (`list/show`), fallback to direct DB read? Decision: allow direct DB read for `list/show` when daemon down, but write cmds (`create/pause/remove`) require daemon or direct DB with warning. Simpler: always allow direct DB when daemon down except `status/kill`.
+* Root cmd has no implicit daemon behavior; all lifecycle operations live under `cronmate daemon`.
+* `daemon start [--foreground]`, `daemon status [--watch]`, `daemon stop` (alias `kill`), and `daemon restart [--foreground]` are the daemon lifecycle surface.
+* Each job cmd uses client: `internal/daemon/client.go` that dials UDS. If daemon not running for read cmds (`list/show`), fallback to direct DB read? Decision: allow direct DB read for `list/show` when daemon down, but write cmds (`create/pause/remove`) require daemon or direct DB with warning. Simpler: always allow direct DB when daemon down except `daemon status/stop`.
 * `create`: flags `--name, --schedule, --prompt-file, --model, --tools`. If missing, interactive prompt with `AlecAivazis/survey` or `charmbracelet/huh`. Copy prompt file into `prompts_dir` if outside? Keep original path but warn. Insert into DB.
 * `edit <job>`: 2 modes to be decided (see Section 9). For now: open prompt file in `$EDITOR`. After editor closes, re-hash, maybe update DB `updated_at`. Do not parse frontmatter yet pending Q4.
 * `list/show`: table writer (`olekukonko/tablewriter`).
@@ -422,8 +426,8 @@ Go libs:
 
 ### Phase 3: Daemon Singleton
 * `daemon.Daemon` pidfile flock, UDS HTTP server, client dialer.
-* `status/kill/restart` commands.
-* Bare `cronmate` = start if down else status.
+* `daemon start/status/stop/restart` commands; `stop` has a `kill` alias.
+* Bare `cronmate` and bare `cronmate daemon` only show help.
 * Signal handling.
 * **Learn:** goroutines, channels, `context`, `net`, `net/http`, `syscall`, `os/signal`.
 
@@ -457,7 +461,7 @@ Go libs:
 
 ### Phase 7: Hardening + Logs
 * Permissions audit at startup and keyring API key management outside the read-only config command.
-* `logs -f` via SSE or chunked HTTP over UDS, includes MCP server logs.
+* `daemon logs -f` via SSE or chunked HTTP over UDS, includes MCP server logs.
 * `golangci-lint`, `go vet`, integration test e2e including MCP mock server.
 * **Learn:** security, file modes, keyring, streaming.
 
